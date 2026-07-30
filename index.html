@@ -364,7 +364,7 @@ function parseRawPOLines(headers, rows){
     return rows.map(r=>{
       const qtyOrdered = +r.units_ordered||0;
       const qtyDelivered = Math.max(0, qtyOrdered - (+r.remaining_quantity||0));
-      const valueExclTax = +r.total_amount||0;
+      const valueExclTax = qtyOrdered * (+r.cost_price||0);
       return {
         po: String(r.po_number).trim(), platform:'Blinkit',
         createdDate: parseFlexDate(r.order_date), appointmentDate: parseFlexDate(r.appointment_date),
@@ -381,7 +381,7 @@ function parseRawPOLines(headers, rows){
     return rows.map(r=>{
       const qtyOrdered = +r['Qty']||0;
       const qtyDelivered = +r['GRN Quantity']||0;
-      const valueExclTax = +r['Total Amount']||0;
+      const valueExclTax = qtyOrdered * (+r['Unit Base Cost']||0);
       return {
         po: String(r['PO No.']).trim(), platform:'Zepto',
         createdDate: parseFlexDate(r['PO Date']), appointmentDate: null,
@@ -398,7 +398,7 @@ function parseRawPOLines(headers, rows){
     return rows.map(r=>{
       const qtyOrdered = +r.OrderedQty||0;
       const qtyDelivered = +r.ReceivedQty||0;
-      const valueExclTax = +r.PoLineValueWithTax||0;
+      const valueExclTax = qtyOrdered * (+r.UnitBasedCost||0);
       return {
         po: String(r.PoNumber).trim(), platform:'Instamart',
         createdDate: parseFlexDate(r.PoCreatedAt), appointmentDate: null,
