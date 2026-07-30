@@ -361,7 +361,7 @@ function daysFromToday(d){ return d ? Math.round((d - new Date())/86400000) : nu
 function parseRawPOLines(headers, rows){
   const h = headers.map(x=>x.trim());
   if(h.includes('po_number') && h.includes('units_ordered')){
-    return rows.map(r=>{
+    return rows.filter(r=>(r.po_state||'').trim() !== 'Cancelled post Creation').map(r=>{
       const qtyOrdered = +r.units_ordered||0;
       const qtyDelivered = Math.max(0, qtyOrdered - (+r.remaining_quantity||0));
       const valueExclTax = qtyOrdered * (+r.cost_price||0);
@@ -378,7 +378,7 @@ function parseRawPOLines(headers, rows){
     });
   }
   if(h.includes('PO No.') && h.includes('Qty')){
-    return rows.map(r=>{
+    return rows.filter(r=>(r['Status']||'').trim().toUpperCase() !== 'CANCELLED').map(r=>{
       const qtyOrdered = +r['Qty']||0;
       const qtyDelivered = +r['GRN Quantity']||0;
       const valueExclTax = qtyOrdered * (+r['Unit Base Cost']||0);
@@ -395,7 +395,10 @@ function parseRawPOLines(headers, rows){
     });
   }
   if(h.includes('PoNumber') && h.includes('OrderedQty')){
-    return rows.map(r=>{
+    return rows.filter(r=>
+      (r.InternalExternalPo||'').trim().toLowerCase() === 'external' &&
+      (r.Status||'').trim().toLowerCase() !== 'cancelled'
+    ).map(r=>{
       const qtyOrdered = +r.OrderedQty||0;
       const qtyDelivered = +r.ReceivedQty||0;
       const valueExclTax = qtyOrdered * (+r.UnitBasedCost||0);
