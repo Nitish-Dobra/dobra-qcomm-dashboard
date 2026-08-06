@@ -183,7 +183,7 @@
     <div class="topbar">
       <div>
         <h2 id="viewTitle">PO Dashboard</h2>
-        <div class="desc" id="viewDesc">PO received, delivered, scheduling status and items needing action — all values exclude tax.</div>
+        <div class="desc" id="viewDesc">PO received, scheduling status, expiry and cancellations, plus a value-only delivery pipeline — all values exclude tax.</div>
       </div>
       <div class="filters">
         <label class="btn ghost" style="cursor:pointer;">
@@ -210,7 +210,7 @@
     <div class="view active" id="view-po">
       <div class="kpi-row" id="poKpis"></div>
       <div class="panel">
-        <div class="panel-head"><h3>PO Pipeline</h3><span class="hint">Received → Scheduled → Delivered</span></div>
+        <div class="panel-head"><h3>PO Pipeline</h3><span class="hint">PO value, excl. tax — cancelled POs excluded</span></div>
         <div class="pipeline" id="pipeline"></div>
       </div>
       <div class="panel">
@@ -361,56 +361,59 @@ function daysFromToday(d){ return d ? Math.round((d - new Date())/86400000) : nu
 function parseRawPOLines(headers, rows){
   const h = headers.map(x=>x.trim());
   if(h.includes('po_number') && h.includes('units_ordered')){
-    return rows.filter(r=>(r.po_state||'').trim() !== 'Cancelled post Creation').map(r=>{
+    return rows.map(r=>{
       const qtyOrdered = +r.units_ordered||0;
       const qtyDelivered = Math.max(0, qtyOrdered - (+r.remaining_quantity||0));
       const valueExclTax = qtyOrdered * (+r.cost_price||0);
+      const rawStatus = r.po_state||'';
       return {
         po: String(r.po_number).trim(), platform:'Blinkit',
         createdDate: parseFlexDate(r.order_date), appointmentDate: parseFlexDate(r.appointment_date),
         expiryDate: parseFlexDate(r.expiry_date),
         qtyOrdered, qtyDelivered, valueExclTax,
         valueDelivered: qtyOrdered ? valueExclTax*(qtyDelivered/qtyOrdered) : 0,
-        rawStatus: r.po_state||'', skuName: r.name||'',
+        rawStatus, skuName: r.name||'',
         category: classifyCategory(r.name),
         appointmentTracked: true,
+        isCancelled: rawStatus.trim() === 'Cancelled post Creation',
       };
     });
   }
   if(h.includes('PO No.') && h.includes('Qty')){
-    return rows.filter(r=>(r['Status']||'').trim().toUpperCase() !== 'CANCELLED').map(r=>{
+    return rows.map(r=>{
       const qtyOrdered = +r['Qty']||0;
       const qtyDelivered = +r['GRN Quantity']||0;
       const valueExclTax = qtyOrdered * (+r['Unit Base Cost']||0);
+      const rawStatus = r['Status']||'';
       return {
         po: String(r['PO No.']).trim(), platform:'Zepto',
         createdDate: parseFlexDate(r['PO Date']), appointmentDate: null,
         expiryDate: parseFlexDate(r['PO Expiry Date']),
         qtyOrdered, qtyDelivered, valueExclTax,
         valueDelivered: qtyOrdered ? valueExclTax*(qtyDelivered/qtyOrdered) : 0,
-        rawStatus: r['Status']||'', skuName: r['SKU Desc']||'',
+        rawStatus, skuName: r['SKU Desc']||'',
         category: classifyCategory(r['SKU Desc']),
         appointmentTracked: false,
+        isCancelled: rawStatus.trim().toUpperCase() === 'CANCELLED',
       };
     });
   }
   if(h.includes('PoNumber') && h.includes('OrderedQty')){
-    return rows.filter(r=>
-      (r.InternalExternalPo||'').trim().toLowerCase() === 'external' &&
-      (r.Status||'').trim().toLowerCase() !== 'cancelled'
-    ).map(r=>{
+    return rows.filter(r=>(r.InternalExternalPo||'').trim().toLowerCase() === 'external').map(r=>{
       const qtyOrdered = +r.OrderedQty||0;
       const qtyDelivered = +r.ReceivedQty||0;
       const valueExclTax = qtyOrdered * (+r.UnitBasedCost||0);
+      const rawStatus = r.Status||'';
       return {
         po: String(r.PoNumber).trim(), platform:'Instamart',
         createdDate: parseFlexDate(r.PoCreatedAt), appointmentDate: null,
         expiryDate: parseFlexDate(r.PoExpiryDate),
         qtyOrdered, qtyDelivered, valueExclTax,
         valueDelivered: qtyOrdered ? valueExclTax*(qtyDelivered/qtyOrdered) : 0,
-        rawStatus: r.Status||'', skuName: r.SkuDescription||'',
+        rawStatus, skuName: r.SkuDescription||'',
         category: classifyCategory(r.SkuDescription),
         appointmentTracked: false,
+        isCancelled: rawStatus.trim().toLowerCase() === 'cancelled',
       };
     });
   }
@@ -454,6 +457,39 @@ function isCurrentMonth(d){
   return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear();
 }
 
+/* PO Dashboard pipeline classification (PO-value only, per-platform rules given by Nitish
+   2026-08-06). Cancelled POs are excluded from this bucket set entirely (handled by the
+   'Cancelled' short-circuit) — they're tracked separately as the Summary Metrics' "PO Cancelled"
+   card, not folded into Delivered/YetToBeDelivered/NotDelivered.
+   - Blinkit (qty-based): any delivered qty > 0 -> Delivered (partial counts as delivered); zero
+     delivered qty is split by expiry date (expired -> Not Delivered, not yet -> Yet to be Delivered).
+   - Zepto / Swiggy (status-text based): explicit status -> bucket maps below. An unrecognized
+     status falls back to a qty-based guess rather than silently dropping the PO from every bucket. */
+function computePipelineStatus(p){
+  if(p.isCancelled) return 'Cancelled';
+  if(p.platform==='Blinkit'){
+    if(p.qtyDelivered>0) return 'Delivered';
+    const days = daysFromToday(p.expiryDate);
+    return (days!==null && days<0) ? 'NotDelivered' : 'YetToBeDelivered';
+  }
+  const s = (p.rawStatus||'').trim().toUpperCase();
+  if(p.platform==='Zepto'){
+    if(s==='PENDING_ACKNOWLEDGEMENT' || s==='ASN PENDING') return 'YetToBeDelivered';
+    if(s==='ASN CREATED' || s==='PENDING GRN' || s==='COMPLETED') return 'Delivered';
+    if(s==='EXPIRED') return 'NotDelivered';
+    console.warn('Zepto: unrecognized PO status for pipeline bucket, falling back to qty-based guess:', p.rawStatus);
+    return p.qtyDelivered>0 ? 'Delivered' : 'YetToBeDelivered';
+  }
+  if(p.platform==='Instamart'){
+    if(s==='CONFIRMED') return 'YetToBeDelivered';
+    if(s==='COMPLETED') return 'Delivered';
+    if(s==='EXPIRED') return 'NotDelivered';
+    console.warn('Swiggy: unrecognized PO status for pipeline bucket, falling back to qty-based guess:', p.rawStatus);
+    return p.qtyDelivered>0 ? 'Delivered' : 'YetToBeDelivered';
+  }
+  return p.qtyDelivered>0 ? 'Delivered' : 'YetToBeDelivered';
+}
+
 function rebuildFromRawLines(lines){
   lines = lines.filter(l=>isCurrentMonth(l.createdDate));
   SKU_ROWS = lines;
@@ -468,7 +504,7 @@ function rebuildFromRawLines(lines){
         po:l.po, platform:l.platform, categories:new Set(),
         createdDate:l.createdDate, appointmentDate:null, appointmentTracked:l.appointmentTracked,
         expiryDate:l.expiryDate, qtyOrdered:0, qtyDelivered:0, valueExclTax:0, valueDelivered:0,
-        rawStatus:l.rawStatus,
+        rawStatus:l.rawStatus, isCancelled:false,
       };
     }
     const p = poMap[key];
@@ -478,6 +514,7 @@ function rebuildFromRawLines(lines){
     p.qtyDelivered += l.qtyDelivered;
     p.valueExclTax += l.valueExclTax;
     p.valueDelivered += l.valueDelivered;
+    if(l.isCancelled) p.isCancelled = true;
   });
 
   // NOTE: unlike the retired order-control-tower.html, this month-scoped view does NOT add stub
@@ -494,6 +531,7 @@ function rebuildFromRawLines(lines){
 
   DATA = Object.values(poMap).map(p=>{
     const normStatus = (p.qtyOrdered>0 && p.qtyDelivered >= p.qtyOrdered*0.98) ? 'Delivered' : 'Not Delivered';
+    const pipelineStatus = computePipelineStatus(p);
     const billedValue = BILLED_BY_PO[p.po] || 0;
     const category = p.categories.size===1 ? [...p.categories][0] : (p.categories.size>1 ? 'MIXED' : null);
     return {
@@ -505,6 +543,7 @@ function rebuildFromRawLines(lines){
       qtyOrdered: p.qtyOrdered,
       valueExclTax: p.valueExclTax,
       rawStatus: p.rawStatus, normStatus,
+      isCancelled: !!p.isCancelled, pipelineStatus,
       qtyDelivered: p.qtyDelivered, valueDelivered: p.valueDelivered,
       billedValue: Math.round(billedValue),
     };
@@ -521,6 +560,7 @@ function filtered(){
 }
 function filteredSku(){
   return SKU_ROWS.filter(r =>
+    !r.isCancelled &&
     (filters.platform==='all'||r.platform===filters.platform) &&
     (filters.category==='all'||r.category===filters.category)
   );
@@ -528,7 +568,7 @@ function filteredSku(){
 
 /* ---------------- NAV ---------------- */
 const titles = {
-  po:['PO Dashboard','PO received, delivered, scheduling status and items needing action — all values exclude tax.'],
+  po:['PO Dashboard','PO received, scheduling status, expiry and cancellations, plus a value-only delivery pipeline — all values exclude tax.'],
   billing:['Billing Dashboard','Billed vs not-billed POs reconciled against the Tally dump, with fill rate — values exclude tax.'],
   delivery:['Delivery Status','Delivered vs not-delivered POs by normalized status bucket, with fill rate — values exclude tax.'],
   category:['Category Level','Boxes ordered by category using confirmed case-pack sizes.'],
@@ -551,32 +591,49 @@ document.getElementById('fCategory').addEventListener('change', e=>{filters.cate
 /* ---------------- RENDER: PO DASHBOARD ---------------- */
 let charts = {};
 function renderPO(){
-  const rows = filtered();
+  const rows = filtered(); // platform/category-scoped, includes cancelled — Summary Metrics needs the full set
+  const nonCancelled = rows.filter(r=>!r.isCancelled);
+
+  // --- PO Summary Metrics: count + value (Cost x Units, excl tax) each ---
   const received = rows.length;
   const receivedVal = rows.reduce((s,r)=>s+r.valueExclTax,0);
-  const delivered = rows.filter(r=>r.normStatus==='Delivered').length;
-  // "No appointment" only makes sense for channels that actually track an appointment date
-  // (currently just Blinkit's appointment_date — Zepto/Swiggy raw dumps don't expose one).
-  const pendingSchedule = rows.filter(r=>r.appointmentTracked && !r.appointmentDate && r.normStatus!=='Delivered').length;
-  const scheduled = rows.filter(r=>r.appointmentDate && r.normStatus!=='Delivered').length;
-  const noAppt = rows.filter(r=>r.appointmentTracked && !r.appointmentDate && r.normStatus!=='Delivered');
-  const nearExpiry = rows.filter(r=>r.expiryDays!==null && r.expiryDays<=3 && r.normStatus!=='Delivered');
+
+  // "No appointment"/"Scheduled" only make sense for channels that actually track an appointment
+  // date (currently just Blinkit's appointment_date — Zepto/Swiggy raw dumps don't expose one).
+  // Cancelled POs are excluded — a cancelled PO isn't meaningfully "pending scheduling".
+  const scheduled = nonCancelled.filter(r=>r.appointmentDate && r.pipelineStatus!=='Delivered');
+  const pendingSchedule = nonCancelled.filter(r=>r.appointmentTracked && !r.appointmentDate && r.pipelineStatus!=='Delivered');
+  // "PO Expired" = the same set that feeds the Pipeline segment's "PO's Not Delivered" bucket
+  // (Blinkit: zero delivered qty past its expiry date; Zepto/Swiggy: raw status = Expired) —
+  // shown here as its own named Summary card for visibility, not a separately-defined rule.
+  const expired = nonCancelled.filter(r=>r.pipelineStatus==='NotDelivered');
+  const cancelled = rows.filter(r=>r.isCancelled);
+
+  const sumVal = arr => arr.reduce((s,r)=>s+r.valueExclTax,0);
 
   document.getElementById('poKpis').innerHTML = `
     ${kpi('PO Received', received, money(receivedVal))}
-    ${kpi('PO Delivered', delivered, '', 'good')}
-    ${kpi('Pending Scheduling', pendingSchedule, '', pendingSchedule>0?'warn':'')}
-    ${kpi('Scheduled POs', scheduled)}
-    ${kpi('No Appointment', noAppt.length, '', noAppt.length>0?'crit':'')}
-    ${kpi('Near Expiry (≤3d)', nearExpiry.length, '', nearExpiry.length>0?'crit':'')}
+    ${kpi('PO Scheduled', scheduled.length, money(sumVal(scheduled)))}
+    ${kpi('PO Pending for Scheduling', pendingSchedule.length, money(sumVal(pendingSchedule)), pendingSchedule.length>0?'warn':'')}
+    ${kpi('PO Expired', expired.length, money(sumVal(expired)), expired.length>0?'crit':'')}
+    ${kpi('PO Cancelled', cancelled.length, money(sumVal(cancelled)))}
   `;
+
+  // --- PO Pipeline segment: PO value only (Cost x Units, excl tax), Cancelled excluded entirely ---
+  const totalReceivedVal = sumVal(nonCancelled);
+  const deliveredVal = sumVal(nonCancelled.filter(r=>r.pipelineStatus==='Delivered'));
+  const yetToBeDeliveredVal = sumVal(nonCancelled.filter(r=>r.pipelineStatus==='YetToBeDelivered'));
+  const notDeliveredVal = sumVal(nonCancelled.filter(r=>r.pipelineStatus==='NotDelivered'));
 
   document.getElementById('pipeline').innerHTML = `
-    ${stage(received,'Received')}
-    ${stage(scheduled+delivered,'Scheduled')}
-    ${stage(delivered,'Delivered')}
+    ${stageVal(totalReceivedVal,"Total PO's Received")}
+    ${stageVal(deliveredVal,"PO's Delivered")}
+    ${stageVal(yetToBeDeliveredVal,"PO's Yet to be Delivered")}
+    ${stageVal(notDeliveredVal,"PO's Not Delivered")}
   `;
 
+  const noAppt = nonCancelled.filter(r=>r.appointmentTracked && !r.appointmentDate && r.pipelineStatus!=='Delivered');
+  const nearExpiry = nonCancelled.filter(r=>r.expiryDays!==null && r.expiryDays<=3 && r.pipelineStatus!=='Delivered');
   const actionRows = [...new Set([...noAppt,...nearExpiry])];
   renderTable('tbl-po-action', actionRows,
     ['po','platform','categoryName','valueExclTax','appointmentDate','expiryDate','expiryDays','rawStatus'],
@@ -588,10 +645,16 @@ function kpi(label,val,sub='',cls=''){
 function stage(n,label){
   return `<div class="stage"><div class="n tabular">${n}</div><div class="t">${label}</div></div>`;
 }
+function stageVal(v,label){
+  return `<div class="stage"><div class="n tabular">${money(v)}</div><div class="t">${label}</div></div>`;
+}
 
 /* ---------------- RENDER: BILLING ---------------- */
 function renderBilling(){
-  const rows = filtered();
+  // Excludes cancelled POs — they were never billable, and used to be dropped before they even
+  // reached DATA; now that DATA retains them (for the PO Dashboard's "PO Cancelled" metric), this
+  // view has to filter them back out itself to keep its own totals unchanged.
+  const rows = filtered().filter(r=>!r.isCancelled);
   const overall = rows.reduce((s,r)=>s+r.valueExclTax,0);
   const billed = rows.reduce((s,r)=>s+r.billedValue,0);
   const notBilled = overall - billed;
@@ -661,7 +724,8 @@ document.getElementById('tallyUpload').addEventListener('change', function(e){
 
 /* ---------------- RENDER: DELIVERY ---------------- */
 function renderDelivery(){
-  const rows = filtered();
+  // Excludes cancelled POs, same reasoning as renderBilling() above.
+  const rows = filtered().filter(r=>!r.isCancelled);
   const delivered = rows.filter(r=>r.normStatus==='Delivered');
   const notDelivered = rows.filter(r=>r.normStatus==='Not Delivered');
   const delVal = delivered.reduce((s,r)=>s+r.valueDelivered,0);
@@ -770,10 +834,10 @@ function toCSV(rows){
   return lines.join('\n');
 }
 function downloadCSV(kind){
-  const rows = filtered();
+  const rows = filtered().filter(r=>!r.isCancelled);
   let data, name;
   if(kind==='po-action'){
-    data = rows.filter(r=>(r.appointmentTracked && !r.appointmentDate || (r.expiryDays!==null && r.expiryDays<=3)) && r.normStatus!=='Delivered');
+    data = rows.filter(r=>(r.appointmentTracked && !r.appointmentDate || (r.expiryDays!==null && r.expiryDays<=3)) && r.pipelineStatus!=='Delivered');
     name='po_action_required.csv';
   } else if(kind==='billing'){ data = rows; name='billing_reconciliation.csv'; }
   else if(kind==='delivery'){ data = rows; name='delivery_status.csv'; }
